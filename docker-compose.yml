@@ -27,6 +27,9 @@ services:
       - PARAPHEUR_PUBLIC_URL=${PARAPHEUR_PUBLIC_URL:-https://parapheur.ivry94.fr}
       - APP_BASE_URL=${APP_BASE_URL:-https://parapheur.ivry94.fr}
       - FRONTEND_URL=${FRONTEND_URL:-https://parapheur.ivry94.fr}
+    ports:
+      # API appelable par d'autres outils. Port hôte configurable (BACKEND_PORT).
+      - "${BACKEND_PORT:-3004}:3001"
     volumes:
       # Réglages SQLite (app_settings, mail_settings, ad_settings, frizbi…).
       - ./backend/data:/app/data
@@ -41,7 +44,8 @@ services:
       dockerfile: Dockerfile
     container_name: parapheur-frontend
     ports:
-      - "5173:5173"
+      # Back-office de gestion. Port hôte configurable (BACKOFFICE_PORT).
+      - "${BACKOFFICE_PORT:-3005}:5173"
     depends_on:
       - backend
     networks:
@@ -59,7 +63,8 @@ services:
       - BACKEND_URL=${BACKEND_URL:-http://backend:3001}
       - PARAPHEUR_DOMAIN=${PARAPHEUR_DOMAIN:-parapheur.ivry94.fr}
     ports:
-      - "5177:5177"
+      # Front public (signature + vérification). Port hôte configurable (DMZ_PORT).
+      - "${DMZ_PORT:-3006}:5177"
     depends_on:
       - backend
     networks:

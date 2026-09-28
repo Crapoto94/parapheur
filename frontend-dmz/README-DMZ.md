@@ -26,11 +26,11 @@ l'admin, etc. sous `/api/*` — ce proxy ne laisse passer que les 4 chemins
 ci-dessus, pas `/api/` en entier.
 
 ```
-Internet ──HTTPS──▶ [Reverse proxy DMZ existant] ──HTTP:5177──▶ [conteneur parapheur-dmz]
+Internet ──HTTPS──▶ [Reverse proxy DMZ existant] ──HTTP:3006──▶ [conteneur parapheur-dmz]
                                                                          │
                                                            (proxy nginx interne, server-side)
                                                                          │
-DMZ ──────────────────────────── firewall (TCP 3001 uniquement) ──────▶ LAN [backend:3001]
+DMZ ──────────────────────────── firewall (TCP 3004 uniquement) ──────▶ LAN [backend]
 ```
 
 ## Arborescence (autonome)
@@ -60,9 +60,9 @@ frontend-dmz/
 ## Pré-requis réseau (équipe réseau/firewall)
 
 1. **Règle firewall DMZ → LAN** : autoriser uniquement le flux de l'hôte Docker
-   DMZ vers l'adresse LAN du backend, **port TCP 3001**.
+   DMZ vers l'adresse LAN du backend, **port TCP 3004**.
 2. Le backend publie déjà ce port sur l'hôte (`docker-compose.yml` racine,
-   service `backend`, `"3001:3001"`).
+   service `backend`, `"${BACKEND_PORT:-3004}:3001"`).
 3. Le DNS public doit pointer vers l'hôte Docker DMZ (ou votre reverse proxy
    DMZ existant, qui termine le TLS).
 
@@ -75,7 +75,7 @@ cp env.example .env
 Puis éditer `.env` :
 
 ```
-BACKEND_URL=http://<ip-lan-du-serveur-appdsi>:3001
+BACKEND_URL=http://<ip-lan-du-serveur-appdsi>:3004
 PARAPHEUR_DOMAIN=chat.ivry94.fr
 ```
 
@@ -88,16 +88,17 @@ Ce dossier est intégré au `docker-compose.yml` **à la racine du dépôt**
 docker compose up -d --build dmz
 ```
 
-Le conteneur écoute en HTTP simple sur le port **5177** de l'hôte DMZ.
+Le conteneur écoute en HTTP simple sur le port **3006** de l'hôte DMZ (nginx
+écoute sur 5177 dans le conteneur).
 `entrypoint.sh` refuse de démarrer si `BACKEND_URL` n'est pas défini.
 
-> Si le port hôte 5177 est déjà pris, ne changez que la partie **hôte** du
-> mapping : `"5178:5177"` (nginx écoute sur 5177 dans le conteneur). Mapper
-> `"5178:5178"` ne fonctionne pas.
+> Le port hôte se règle par `DMZ_PORT` (défaut 3006) : ne changez que la partie
+> **hôte** du mapping (`"${DMZ_PORT}:5177"`) car nginx écoute sur 5177 dans le
+> conteneur. Mapper `"3006:3006"` ne fonctionnerait pas.
 
 ## Brancher sur le reverse proxy DMZ
 
-Pointer le reverse proxy DMZ vers `<ip-hote-dmz>:5177` en HTTP pour le host
+Pointer le reverse proxy DMZ vers `<ip-hote-dmz>:3006` en HTTP pour le host
 `PARAPHEUR_DOMAIN` (TLS/HSTS/certificat restent gérés par le reverse proxy).
 
 > **Important** : le host public utilisé pour les liens doit correspondre au
@@ -157,7 +158,7 @@ durcissement + un WAF nginx** (règles natives nginx, sans ModSecurity) :
 
 ```bash
 # Depuis l'hôte Docker DMZ : le backend doit répondre (sinon = règle firewall manquante)
-curl -i http://<ip-lan-du-serveur-appdsi>:3001/api/health
+curl -i http://<ip-lan-du-serveur-appdsi>:3004/api/health
 
 # Une fois le conteneur démarré et le reverse proxy branché :
 curl -i https://<PARAPHEUR_DOMAIN>/

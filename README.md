@@ -6,11 +6,15 @@ dépôt avec ses conteneurs.
 
 ## Composants
 
-| Dossier         | Rôle                                                                 | Conteneur            | Port |
-|-----------------|----------------------------------------------------------------------|----------------------|------|
-| `backend/`      | API du parapheur (signature, vérification, certificats P12, relances) | `parapheur-backend`  | 3001 |
-| `frontend/`     | Back-office : créer/gérer les parapheurs, signataires, délégations    | `parapheur-frontend` | 5173 |
-| `frontend-dmz/` | Front public : signature par lien + vérification par QR code          | `parapheur-dmz`      | 5177 |
+| Dossier         | Rôle                                                                 | Conteneur            | Port hôte (défaut) |
+|-----------------|----------------------------------------------------------------------|----------------------|--------------------|
+| `backend/`      | API du parapheur (signature, vérification, certificats P12, relances) | `parapheur-backend`  | **3004** → 3001 |
+| `frontend/`     | Back-office : créer/gérer les parapheurs, signataires, délégations    | `parapheur-frontend` | **3005** → 5173 |
+| `frontend-dmz/` | Front public : signature par lien + vérification par QR code          | `parapheur-dmz`      | **3006** → 5177 |
+
+Les ports hôte sont choisibles pour ne pas entrer en conflit avec AppDSI
+(3001/5173/5174/5175/5177) ; surchargeables via `BACKEND_PORT`,
+`BACKOFFICE_PORT`, `DMZ_PORT` dans `.env`.
 
 Le back-office inclut la page d'**administration des certificats P12**
 (`/admin/parapheur-certificats`, réservée aux admins) : URL publique du
@@ -34,16 +38,28 @@ L'extraction reste **compatible avec les données existantes** :
 > pointent vers le front public ; l'URL publique reste réglée dans
 > `app_settings` / `PARAPHEUR_PUBLIC_URL`.
 
-## Démarrage rapide
+## Démarrage rapide (Docker)
 
 ```bash
 cp .env.example .env      # renseigner POSTGRES_*, JWT_SECRET, URLs
 docker compose up -d --build
 ```
 
-- Back-office : http://localhost:5173
-- Front public (DMZ) : http://localhost:5177
-- API : http://localhost:3001/api/health
+- API : http://localhost:3004/api/health
+- Back-office : http://localhost:3005
+- Front public (DMZ) : http://localhost:3006
+
+## Démarrage local (Windows, hors Docker)
+
+```bat
+run-all.bat
+```
+
+Ouvre 3 fenêtres : backend (3004), back-office (3005), front DMZ (3006).
+Scripts individuels dans `scripts\` (`run-backend.ps1`, `run-backoffice.ps1`,
+`run-dmz.ps1`). Le backend local lit `backend/.env` et désactive par défaut le
+cron de relances (`DISABLE_PARAPHEUR_CRON=1`) pour ne pas envoyer de vrais
+e-mails depuis un poste.
 
 ## API principale
 
@@ -63,8 +79,8 @@ docker compose up -d --build
 Le conteneur `parapheur-dmz` n'expose que 4 préfixes d'API vers le backend
 (`/api/health`, `/api/auth/magapp-login` en POST, `/api/parapheur/public/`,
 `/api/parapheur/verify/`) et applique un durcissement + WAF nginx. En DMZ
-séparée, définir `BACKEND_URL=http://<ip-lan>:3001` et n'autoriser que le
-TCP 3001 côté firewall. Voir `frontend-dmz/README-DMZ.md`.
+séparée, définir `BACKEND_URL=http://<ip-lan>:3004` et n'autoriser que le
+TCP 3004 côté firewall. Voir `frontend-dmz/README-DMZ.md`.
 
 ## Suivi
 

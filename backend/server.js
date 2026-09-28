@@ -20,6 +20,11 @@
 process.env.TZ = process.env.TZ || 'Europe/Paris';
 process.env.TZ = 'Europe/Paris';
 
+// Charge backend/.env en exécution locale (hors Docker) AVANT de lire la
+// configuration partagée (shared/config, shared/pg_db lisent process.env au
+// chargement). Sans effet en conteneur : le .env n'est pas dans l'image.
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+
 const express = require('express');
 const http = require('http');
 const jwt = require('jsonwebtoken');
@@ -724,12 +729,18 @@ setupDb().then(async (database) => {
     // Initialise PostgreSQL (crée le schéma hub_parapheur s'il n'existe pas).
     await setupPgDb();
 
-    // Relances automatiques du parapheur électronique.
-    try {
-        require('./modules/parapheur/parapheur-cron').start();
-        console.log('[PARAPHEUR CRON] démarré');
-    } catch (e) {
-        console.error('[PARAPHEUR CRON] échec démarrage:', e.message);
+    // Relances automatiques du parapheur électronique. En développement local on
+    // peut les couper (DISABLE_PARAPHEUR_CRON=1) pour ne pas envoyer de vrais
+    // e-mails de relance aux signataires depuis un poste.
+    if (process.env.DISABLE_PARAPHEUR_CRON === '1') {
+        console.log('[PARAPHEUR CRON] désactivé (DISABLE_PARAPHEUR_CRON=1)');
+    } else {
+        try {
+            require('./modules/parapheur/parapheur-cron').start();
+            console.log('[PARAPHEUR CRON] démarré');
+        } catch (e) {
+            console.error('[PARAPHEUR CRON] échec démarrage:', e.message);
+        }
     }
 
     httpServer.listen(PORT, '0.0.0.0', () => {
