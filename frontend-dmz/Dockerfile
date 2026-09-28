@@ -16,8 +16,8 @@ WORKDIR /app
 RUN apk add --no-cache make gcc g++ python3
 
 COPY package*.json ./
-# npm install (et non npm ci) : le lockfile n'est pas versionné pour ce module.
-RUN npm install --no-audit --no-fund
+# Lockfile versionné : build reproductible.
+RUN npm ci --no-audit --no-fund
 
 COPY . .
 RUN npm run build
