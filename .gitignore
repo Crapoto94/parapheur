@@ -1,0 +1,22 @@
+# Dépendances / builds
+node_modules/
+dist/
+public/pdfjs/
+
+# Secrets et configuration locale
+.env
+*.local
+
+# Données et journaux du backend (SQLite de réglages, logs)
+backend/data/*
+!backend/data/.gitkeep
+backend/logs/*
+!backend/logs/.gitkeep
+*.sqlite
+*.db
+*.sqlite.old
+*.log
+
+# Divers
+.DS_Store
+Thumbs.db

@@ -1,0 +1,71 @@
+# Outil autonome « Parapheur électronique » — extrait d'AppDSI.
+#
+#   backend       : API du parapheur (PostgreSQL ivry_admin, stockage SMB/Alfresco)
+#   frontend      : back-office (gestion des parapheurs) — LAN
+#   dmz           : front public (signature + vérification) — DMZ
+#
+# En déploiement réel, seul le service `dmz` est exposé côté Internet via le
+# reverse proxy DMZ ; `frontend` et `backend` restent sur le LAN.
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: parapheur-backend
+    environment:
+      - TZ=Europe/Paris
+      # PostgreSQL externe (base AppDSI ivry_admin, schéma hub_parapheur).
+      - POSTGRES_HOST=${POSTGRES_HOST:-10.103.130.106}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_DB=${POSTGRES_DB:-ivry_admin}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-ivrypassword}
+      # Clé JWT : DOIT être identique à AppDSI pour partager les jetons/liens.
+      - JWT_SECRET=${JWT_SECRET:-supersecretjwtkey}
+      # Domaine public utilisé pour les liens de signature et le QR code.
+      - PARAPHEUR_PUBLIC_URL=${PARAPHEUR_PUBLIC_URL:-https://parapheur.ivry94.fr}
+      - APP_BASE_URL=${APP_BASE_URL:-https://parapheur.ivry94.fr}
+      - FRONTEND_URL=${FRONTEND_URL:-https://parapheur.ivry94.fr}
+    volumes:
+      # Réglages SQLite (app_settings, mail_settings, ad_settings, frizbi…).
+      - ./backend/data:/app/data
+      - ./backend/logs:/app/logs
+    networks:
+      - parapheur-net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: parapheur-frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    networks:
+      - parapheur-net
+    restart: unless-stopped
+
+  dmz:
+    build:
+      context: ./frontend-dmz
+      dockerfile: Dockerfile
+    container_name: parapheur-dmz
+    environment:
+      # Adresse du backend joignable DEPUIS ce conteneur. En stack complète :
+      # http://backend:3001. En DMZ séparée : http://<ip-lan>:3001.
+      - BACKEND_URL=${BACKEND_URL:-http://backend:3001}
+      - PARAPHEUR_DOMAIN=${PARAPHEUR_DOMAIN:-parapheur.ivry94.fr}
+    ports:
+      - "5177:5177"
+    depends_on:
+      - backend
+    networks:
+      - parapheur-net
+    restart: unless-stopped
+
+networks:
+  parapheur-net:
+    driver: bridge
