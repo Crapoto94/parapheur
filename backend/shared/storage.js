@@ -14,18 +14,10 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { getSqlite } = require('./database');
+const settings = require('./settings');
 const smb = require('./smb_client');
 
 const STORAGE_PREFIX = 'storage';
-
-const SETTING_KEYS = {
-    backend: 'storage.backend',
-    root_path: 'storage.root_path',
-    login: 'storage.login',
-    password: 'storage.password',
-    domain: 'storage.domain',
-};
 
 /**
  * Mode SMB applicatif (accès au partage UNC directement depuis Node, comme le
@@ -115,18 +107,12 @@ function isWindowsStylePath(p) {
     return typeof p === 'string' && (/\\/.test(p) || /^[A-Za-z]:/.test(p));
 }
 
-/** Lit la configuration de stockage depuis app_settings (SQLite). */
+/** Lit la configuration de stockage (.env, surchargée par data/settings.json). */
 async function getStorageConfig() {
     const config = { backend: 'filesystem', root_path: '', login: '', password: '', domain: '' };
-    const db = getSqlite();
-    if (!db) return config;
-    for (const [field, key] of Object.entries(SETTING_KEYS)) {
-        try {
-            const row = await db.get('SELECT setting_value FROM app_settings WHERE setting_key = ?', key);
-            if (row && row.setting_value != null) config[field] = row.setting_value;
-        } catch (e) {
-            // table absente / non initialisée -> on garde les valeurs par défaut
-        }
+    const s = settings.section('storage');
+    for (const field of Object.keys(config)) {
+        if (s[field] !== undefined && s[field] !== null) config[field] = s[field];
     }
     if (!config.backend) config.backend = 'filesystem';
     return config;
@@ -134,28 +120,13 @@ async function getStorageConfig() {
 
 /** Sauvegarde la configuration de stockage. Ne touche pas au mot de passe si absent. */
 async function saveStorageConfig({ backend, root_path, login, password, domain }) {
-    const db = getSqlite();
-    if (!db) throw new Error('Base SQLite non initialisée.');
-
-    const upsert = `INSERT INTO app_settings (setting_key, setting_value, description)
-        VALUES (?, ?, ?)
-        ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value, description = excluded.description`;
-
-    if (backend !== undefined) {
-        await db.run(upsert, [SETTING_KEYS.backend, backend || 'filesystem', 'Backend de stockage : filesystem | ged']);
-    }
-    if (root_path !== undefined) {
-        await db.run(upsert, [SETTING_KEYS.root_path, normalizeRootPath(root_path), 'Chemin racine de stockage (UNC ou local)']);
-    }
-    if (login !== undefined) {
-        await db.run(upsert, [SETTING_KEYS.login, login || '', 'Identifiant pour le partage de stockage (si applicable)']);
-    }
-    if (password !== undefined && password !== '' && password !== '••••••••') {
-        await db.run(upsert, [SETTING_KEYS.password, password, 'Mot de passe pour le partage de stockage (si applicable)']);
-    }
-    if (domain !== undefined) {
-        await db.run(upsert, [SETTING_KEYS.domain, domain || '', 'Domaine SMB pour le partage de stockage (si applicable)']);
-    }
+    const patch = {};
+    if (backend !== undefined) patch.backend = backend || 'filesystem';
+    if (root_path !== undefined) patch.root_path = normalizeRootPath(root_path);
+    if (login !== undefined) patch.login = login || '';
+    if (password !== undefined && password !== '' && password !== '••••••••') patch.password = password;
+    if (domain !== undefined) patch.domain = domain || '';
+    settings.updateSection('storage', patch);
 }
 
 /**

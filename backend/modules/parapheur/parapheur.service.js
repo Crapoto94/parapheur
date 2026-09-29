@@ -10,12 +10,13 @@
 const fs = require('fs');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const { pgDb, getSqlite } = require('../../shared/database');
+const { pgDb } = require('../../shared/database');
+const settings = require('../../shared/settings');
+const apm = require('../../shared/apm');
 const storage = require('../../shared/storage');
 const docsService = require('../../shared/documents.service');
 const { SECRET_KEY } = require('../../shared/config');
 const forge = require('node-forge');
-const axios = require('axios');
 const QRCode = require('qrcode');
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
 const archiver = require('archiver');
@@ -102,14 +103,8 @@ async function sendParapheurEmail(to, tpl) {
 }
 
 async function getAppBaseUrl() {
-    try {
-        const db = getSqlite();
-        const row = await db.get("SELECT setting_value FROM app_settings WHERE setting_key = 'app_base_url'");
-        const val = row?.setting_value?.trim();
-        return val || process.env.APP_BASE_URL || process.env.APP_URL || 'http://localhost:5173';
-    } catch {
-        return process.env.APP_BASE_URL || process.env.APP_URL || 'http://localhost:5173';
-    }
+    const val = settings.getAppBaseUrl();
+    return val || process.env.APP_BASE_URL || process.env.APP_URL || 'http://localhost:5173';
 }
 
 /**
@@ -174,10 +169,6 @@ async function getSignatureBaseUrl() {
     return s.effective_base_url || await getAppBaseUrl();
 }
 
-const PUBLIC_BASE_URL_KEY = 'parapheur.public_base_url';
-const SEAL_ENABLED_KEY = 'parapheur.seal_enabled';
-const BULK_SIGN_MENTION_KEY = 'parapheur.bulk_sign_mention';
-const NOTIFY_INTERVAL_KEY = 'parapheur.notify_interval_minutes';
 const VERIFY_PATH = '/parapheur/verification';
 
 /**
@@ -191,7 +182,7 @@ const DEFAULT_BULK_SIGN_MENTION =
     "expressément à toute contestation tirée de l'absence de lecture intégrale de chaque document.";
 
 /**
- * Paramétrage du parapheur (SQLite app_settings) :
+ * Paramétrage du parapheur (`.env` + data/settings.json) :
  * - `public_base_url` : URL externe (ex. https://parapheur.ivry94.fr) utilisée
  *   pour construire les liens de signature (e-mail) ET le QR code de vérification,
  *   afin qu'ils soient joignables hors du réseau interne (le domaine peut changer,
@@ -200,27 +191,15 @@ const DEFAULT_BULK_SIGN_MENTION =
  * l'URL de base interne de l'application (`getAppBaseUrl`).
  */
 async function getParapheurSettings() {
-    let publicBaseUrl = '';
-    let sealEnabled = true;
-    let bulkSignMention = '';
-    let notifyIntervalMinutes = 2;
-    try {
-        const db = getSqlite();
-        if (db) {
-            const row = await db.get('SELECT setting_value FROM app_settings WHERE setting_key = ?', [PUBLIC_BASE_URL_KEY]);
-            publicBaseUrl = (row && row.setting_value) ? String(row.setting_value).trim() : '';
-            const sealRow = await db.get('SELECT setting_value FROM app_settings WHERE setting_key = ?', [SEAL_ENABLED_KEY]);
-            if (sealRow && sealRow.setting_value != null) sealEnabled = String(sealRow.setting_value) !== 'false';
-            const bulkRow = await db.get('SELECT setting_value FROM app_settings WHERE setting_key = ?', [BULK_SIGN_MENTION_KEY]);
-            bulkSignMention = (bulkRow && bulkRow.setting_value) ? String(bulkRow.setting_value).trim() : '';
-            const notifyRow = await db.get('SELECT setting_value FROM app_settings WHERE setting_key = ?', [NOTIFY_INTERVAL_KEY]);
-            const notifyVal = notifyRow && notifyRow.setting_value != null ? Number(notifyRow.setting_value) : NaN;
-            if (Number.isFinite(notifyVal) && notifyVal > 0) notifyIntervalMinutes = Math.min(240, Math.round(notifyVal));
-        }
-    } catch { /* configuration non initialisée */ }
-    // Repli par variable d'environnement : un déploiement ou une base restaurée sans réglage
-    // ne doit jamais retomber silencieusement sur `http://localhost:5173` dans les liens de
-    // signature/QR (ils doivent pointer sur le domaine public du parapheur, ex. parapheur.ivry94.fr).
+    const s = settings.section('parapheur');
+    let publicBaseUrl = String(s.public_base_url || '').trim();
+    const sealEnabled = s.seal_enabled !== false;
+    const bulkSignMention = String(s.bulk_sign_mention || '').trim();
+    const notifyRaw = Number(s.notify_interval_minutes);
+    const notifyIntervalMinutes = Number.isFinite(notifyRaw) && notifyRaw > 0 ? Math.min(240, Math.round(notifyRaw)) : 2;
+    // Repli par variable d'environnement : un déploiement sans fichier de réglages
+    // ne doit jamais retomber silencieusement sur `http://localhost:5173` dans les
+    // liens de signature/QR (ils doivent pointer sur le domaine public du parapheur).
     if (!publicBaseUrl) publicBaseUrl = String(process.env.PARAPHEUR_PUBLIC_URL || '').trim().replace(/\/+$/, '');
     const internal = await getAppBaseUrl();
     return {
@@ -235,30 +214,25 @@ async function getParapheurSettings() {
 }
 
 async function saveParapheurSettings({ publicBaseUrl, sealEnabled, bulkSignMention, notifyIntervalMinutes } = {}) {
-    const db = getSqlite();
-    if (!db) throw { status: 503, message: 'Configuration indisponible (base non initialisée).' };
-    const upsert = `INSERT INTO app_settings (setting_key, setting_value, description)
-        VALUES (?, ?, ?)
-        ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value, description = excluded.description`;
+    const patch = {};
     if (publicBaseUrl !== undefined) {
         const value = String(publicBaseUrl || '').trim().replace(/\/+$/, '');
         if (value && !/^https?:\/\//i.test(value)) {
             throw { status: 400, message: "L'URL publique doit commencer par http:// ou https://." };
         }
-        await db.run(upsert, [PUBLIC_BASE_URL_KEY, value, 'URL publique externe du parapheur (lien de vérification du QR code)']);
+        patch.public_base_url = value;
     }
     if (sealEnabled !== undefined) {
-        await db.run(upsert, [SEAL_ENABLED_KEY, sealEnabled === false ? 'false' : 'true', 'Sceau PAdES de fin de circuit (AC interne)']);
+        patch.seal_enabled = sealEnabled !== false;
     }
     if (bulkSignMention !== undefined) {
-        const value = String(bulkSignMention || '').trim().slice(0, 2000);
-        await db.run(upsert, [BULK_SIGN_MENTION_KEY, value, 'Formule juridique affichée avant une signature en masse']);
+        patch.bulk_sign_mention = String(bulkSignMention || '').trim().slice(0, 2000);
     }
     if (notifyIntervalMinutes !== undefined) {
         const n = Number(notifyIntervalMinutes);
-        const value = Number.isFinite(n) && n > 0 ? String(Math.min(240, Math.round(n))) : '2';
-        await db.run(upsert, [NOTIFY_INTERVAL_KEY, value, "Intervalle d'envoi des e-mails de signature (minutes)"]);
+        patch.notify_interval_minutes = Number.isFinite(n) && n > 0 ? Math.min(240, Math.round(n)) : 2;
     }
+    settings.updateSection('parapheur', patch);
     return getParapheurSettings();
 }
 
@@ -284,41 +258,19 @@ function maskPhone(phone) {
     return `${d.slice(0, 2)} •••••• ${d.slice(-2)}`;
 }
 
-/** Envoie un SMS via Frizbi (même mécanisme que les autres modules). */
+/** Envoie un SMS via l'API Ville (APM), comme l'envoi de mails. */
 async function sendSms(mobile, message, source) {
-    const db = getSqlite();
-    if (!db) throw { status: 503, message: 'Service SMS indisponible (configuration non initialisée).' };
-    const frizbi = await db.get('SELECT * FROM frizbi_settings WHERE id = 1');
-    if (!frizbi || !frizbi.is_enabled || !frizbi.client_id || !frizbi.client_secret) {
-        throw { status: 503, message: 'Service SMS (Frizbi) non configuré ou désactivé.' };
-    }
-    const authRes = await axios.post(`${frizbi.api_url}/api/auth/login`, {
-        login: frizbi.client_id,
-        password: frizbi.client_secret,
-    });
-    const frizbiToken = authRes.data && authRes.data.token;
-    if (!frizbiToken) throw { status: 502, message: "Échec d'authentification au service SMS." };
-
     const clean = String(mobile).replace(/\D/g, '');
-    const payload = {
-        customerSmsId: `${source}_${Date.now()}`.substring(0, 50),
-        date: new Date().toISOString(),
-        title: 'Parapheur — code de signature',
-        message,
-        customerSenderId: frizbi.sender_id || 'IVRY',
-        smsContacts: [{
-            customerSmsContactId: `${source}_${clean}`.substring(0, 50),
-            mobile: clean,
-            firstName: '',
-            lastName: '',
-        }],
-    };
-    await axios.post(`${frizbi.api_url}/api/sms/send`, payload, { headers: { Authorization: `Bearer ${frizbiToken}` } });
+    try {
+        await apm.sendSms(clean, message, source);
+    } catch (e) {
+        throw { status: e.status || 503, message: `Service SMS indisponible : ${e.message}` };
+    }
     try {
         await pgDb.run(
             `INSERT INTO hub.sms_logs (recipient, message, sender_id, status, source, created_by)
              VALUES (?, ?, ?, 'sent', ?, ?)`,
-            [clean, message, frizbi.sender_id || 'IVRY', source, 'parapheur']
+            [clean, message, 'APM', source, 'parapheur']
         );
     } catch (e) { /* log non bloquant */ }
 }

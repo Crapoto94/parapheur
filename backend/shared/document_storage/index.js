@@ -8,17 +8,18 @@
  *   - 'both'       : double écriture (local principal + copie Alfresco)
  *
  * En l'absence de ligne pour un module, on retombe sur le réglage global
- * historique `documents.backend` (app_settings), puis sur 'filesystem'.
+ * `documents.backend` (.env `DOCUMENTS_BACKEND`, surchargé par data/settings.json),
+ * puis sur 'filesystem'.
  *
  * L'API exposée par les adaptateurs est identique, pour que documents.service.js
  * soit agnostique du stockage sous-jacent.
  */
-const { pgDb, getSqlite } = require('../database');
+const { pgDb } = require('../database');
+const settings = require('../settings');
 const smbAdapter = require('./smb_adapter');
 const alfrescoAdapter = require('./alfresco_adapter');
 
 const VALID_BACKENDS = ['filesystem', 'alfresco', 'both'];
-const LEGACY_SETTING_KEY = 'documents.backend';
 const CACHE_TTL_MS = 30 * 1000;
 
 /** @type {Map<string, {backend:string, expires:number}>} */
@@ -38,11 +39,7 @@ async function readLegacyBackend() {
     if (legacyCache.backend && Date.now() < legacyCache.expires) return legacyCache.backend;
     let backend = 'filesystem';
     try {
-        const db = getSqlite();
-        if (db) {
-            const row = await db.get('SELECT setting_value FROM app_settings WHERE setting_key = ?', [LEGACY_SETTING_KEY]);
-            backend = normalizeBackend(row && row.setting_value) || 'filesystem';
-        }
+        backend = normalizeBackend(settings.section('documents').backend) || 'filesystem';
     } catch { backend = 'filesystem'; }
     legacyCache = { backend, expires: Date.now() + CACHE_TTL_MS };
     return backend;

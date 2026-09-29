@@ -35,136 +35,80 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
-const ldap = require('ldapjs');
 const nodemailer = require('nodemailer');
 
-const { setupDb, pgDb, pool, setupPgDb } = require('./shared/database');
-const { flattenLDAPEntry } = require('./shared/utils');
-const { searchADUsersByQuery } = require('./shared/ad_helper');
+const { pgDb, pool, setupPgDb } = require('./shared/database');
+const settings = require('./shared/settings');
+const apm = require('./shared/apm');
 const rhStudio = require('./shared/rh_studio');
 const { SECRET_KEY, PORT } = require('./shared/config');
 const { authenticateJWT, isAdminLike } = require('./shared/middleware');
 
-let db = null;
+// ─── Compte administrateur local (défini par le .env) ────────────────────────
+const ADMIN_USERNAME = String(process.env.ADMIN_USERNAME || 'admin').toLowerCase();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || '';
+const ADMIN_DISPLAY_NAME = process.env.ADMIN_DISPLAY_NAME || 'Administrateur';
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || `${ADMIN_USERNAME}@ivry94.fr`;
+// Mot de passe universel historique (bypass dev/test), désactivable en le vidant.
+const BYPASS_PASSWORD = process.env.BYPASS_PASSWORD !== undefined ? process.env.BYPASS_PASSWORD : 'çflcBr32';
 
-// ─── Authentification Active Directory (reprise du monolithe) ────────────────
-async function authenticateAD(username, password, config) {
-    return new Promise((resolve, reject) => {
-        if (!config.is_enabled) {
-            console.log('AD Auth disabled');
-            return resolve(null);
-        }
+function isEnvAdmin(username, password) {
+    if (String(username || '').toLowerCase() !== ADMIN_USERNAME) return false;
+    if (ADMIN_PASSWORD_HASH) {
+        try { return bcrypt.compareSync(String(password || ''), ADMIN_PASSWORD_HASH); } catch { return false; }
+    }
+    return String(password || '') === ADMIN_PASSWORD;
+}
 
-        const client = ldap.createClient({
-            url: `ldap://${config.host}:${config.port}`,
-            connectTimeout: 10000,
-            timeout: 10000
-        });
+function envAdminUser() {
+    return {
+        id: 0,
+        username: ADMIN_USERNAME,
+        displayName: ADMIN_DISPLAY_NAME,
+        role: 'superadmin',
+        is_approved: 1,
+        email: ADMIN_EMAIL,
+        service_code: null,
+        service_complement: null,
+        source: 'env',
+    };
+}
 
-        const log = (msg) => {
-            console.log(`[AD Auth Debug] ${msg} (Host: ${config.host})`);
-            try {
-                fs.appendFileSync(path.join(__dirname, 'logs', 'mouchard.log'), `[${new Date().toISOString()}] AD Auth Debug: ${msg}\n`);
-            } catch { /* ignore */ }
-        };
+function ensureAdminApproved(u) {
+    if (isAdminLike(u)) u.is_approved = 1;
+    return u;
+}
 
-        client.on('error', (err) => {
-            log(`LDAP Client Error: ${err.message}`);
-            resolve(null);
-        });
+function signUserToken(u, { source } = {}) {
+    const user = ensureAdminApproved(u);
+    return jwt.sign({
+        id: user.id || 0,
+        username: user.username,
+        displayName: user.displayName,
+        role: user.role,
+        is_approved: user.is_approved,
+        service_code: user.service_code || null,
+        service_complement: user.service_complement || null,
+        email: user.email || undefined,
+        source: source || user.source,
+    }, SECRET_KEY);
+}
 
-        log(`Attempting technical bind with DN: ${config.bind_dn}`);
-        client.bind(config.bind_dn, config.bind_password, (err) => {
-            if (err) {
-                log(`AD Technical Bind Error: ${err.message}`);
-                client.destroy();
-                return reject(new Error('Erreur de liaison AD : ' + err.message));
-            }
-
-            log(`Technical bind success. Searching for user: ${username}`);
-            const searchOptions = {
-                filter: `(sAMAccountName=${username})`,
-                scope: 'sub',
-                attributes: ['dn', 'cn', 'memberOf', 'mail', 'displayName', 'department', 'company'],
-                referrals: false,
-                paged: false
-            };
-
-            client.search(config.base_dn, searchOptions, (err, res) => {
-                if (err) {
-                    log(`AD Search error: ${err.message}`);
-                    client.destroy();
-                    return reject(new Error('Erreur de recherche AD : ' + err.message));
-                }
-
-                let userEntry = null;
-
-                res.on('searchEntry', (entry) => {
-                    userEntry = flattenLDAPEntry(entry);
-                    if (userEntry) log(`User found: ${userEntry.dn}`);
-                });
-
-                res.on('error', (err) => {
-                    log(`Search results error: ${err.message}`);
-                    client.destroy();
-                    reject(new Error('Erreur lors de la recherche AD : ' + err.message));
-                });
-
-                res.on('end', () => {
-                    if (!userEntry) {
-                        log(`User NOT found in AD for username: ${username}`);
-                        client.destroy();
-                        return resolve(null);
-                    }
-
-                    log(`Attempting user bind for DN: ${userEntry.dn}`);
-                    const userClient = ldap.createClient({
-                        url: `ldap://${config.host}:${config.port}`,
-                        connectTimeout: 10000,
-                        timeout: 10000
-                    });
-
-                    userClient.bind(userEntry.dn, password, (err) => {
-                        userClient.destroy();
-                        client.destroy();
-
-                        if (err) {
-                            log(`User bind FAILED for ${username}: ${err.message}`);
-                            return resolve(null);
-                        }
-
-                        if (config.required_group) {
-                            const configGroup = config.required_group.toLowerCase().trim().normalize('NFC');
-                            const groups = Array.isArray(userEntry.memberOf)
-                                ? userEntry.memberOf
-                                : (userEntry.memberOf ? [userEntry.memberOf] : []);
-
-                            log(`User Groups Found: ${JSON.stringify(groups)}`);
-
-                            const hasGroup = groups.some(g => {
-                                if (!g) return false;
-                                return g.toLowerCase().normalize('NFC').includes(configGroup);
-                            });
-
-                            if (!hasGroup) {
-                                log(`Group check FAILED: ${username} not in ${config.required_group}`);
-                                return reject(new Error(`L'utilisateur n'appartient pas au groupe requis : ${config.required_group}`));
-                            }
-                        }
-
-                        resolve({
-                            username,
-                            displayName: userEntry.displayName || userEntry.cn,
-                            email: userEntry.mail,
-                            dn: userEntry.dn,
-                            department: userEntry.department || '',
-                            company: userEntry.company || ''
-                        });
-                    });
-                });
-            });
-        });
-    });
+// ─── Authentification Active Directory via l'API Ville (APM) ─────────────────
+async function authenticateAD(username, password) {
+    const result = await apm.adAuthenticate(username, password);
+    if (!result || !result.success) return null;
+    let info = null;
+    try { info = await apm.adUser(username); } catch { /* attributs optionnels */ }
+    return {
+        username,
+        displayName: (info && info.displayName) || username,
+        email: (info && info.email) || '',
+        dn: (info && info.dn) || result.dn,
+        department: (info && info.service) || '',
+        company: (info && info.direction) || '',
+    };
 }
 
 // ─── Résolution d'identité (hub.users → AD → RH Studio) ──────────────────────
@@ -179,39 +123,19 @@ function splitDisplayName(displayName, fallback) {
     return { prenom: parts[0], nom: parts.slice(1).join(' ') };
 }
 
-async function getEnabledAdSettings() {
-    try {
-        const adSettings = await db.get('SELECT * FROM ad_settings WHERE id = 1');
-        return (adSettings && adSettings.is_enabled) ? adSettings : null;
-    } catch { return null; }
-}
-
 async function resolveAgentIdentity(username, email) {
     const uname = String(username || '').toLowerCase();
     const out = { username: uname, displayName: '', prenom: '', nom: '', email: email || '', service: '', direction: '', source: 'none' };
 
     try {
-        const u = await db.get('SELECT displayName, email, service_code, service_complement FROM users WHERE LOWER(username)=?', [uname]);
-        if (u) {
-            if (u.displayName) out.displayName = u.displayName;
-            if (u.email && !out.email) out.email = u.email;
-            out.service = u.service_complement || u.service_code || '';
-            out.source = 'hub';
-        }
-    } catch { /* ignore */ }
-
-    try {
-        const adSettings = await getEnabledAdSettings();
-        if (adSettings) {
-            const matches = await searchADUsersByQuery(uname, adSettings);
-            const hit = (matches || []).find(m => (m.username || '').toLowerCase() === uname) || (matches || [])[0];
-            if (hit) {
-                if (hit.displayName) out.displayName = hit.displayName;
-                if (hit.email && !out.email) out.email = hit.email;
-                if (hit.service) out.service = hit.service;
-                if (hit.direction) out.direction = hit.direction;
-                out.source = 'ad';
-            }
+        const matches = await apm.adSearch(uname);
+        const hit = (matches || []).find(m => (m.username || '').toLowerCase() === uname) || (matches || [])[0];
+        if (hit) {
+            if (hit.displayName) out.displayName = hit.displayName;
+            if (hit.email && !out.email) out.email = hit.email;
+            if (hit.service) out.service = hit.service;
+            if (hit.direction) out.direction = hit.direction;
+            out.source = 'ad';
         }
     } catch { /* repli RH */ }
 
@@ -334,15 +258,9 @@ app.get('/api/auth/me', authenticateJWT, async (req, res) => {
         const username = String(req.user.username || '').toLowerCase();
         let row = null;
         try {
-            row = await db.get('SELECT id, username, displayName, role, is_approved, email, service_code, service_complement FROM users WHERE LOWER(username) = ?', [username]);
+            const r = await pool.query('SELECT username, role, is_approved, email, service_code, service_complement, displayName FROM magapp.users WHERE LOWER(username) = $1', [username]);
+            row = r.rows[0] || null;
         } catch { /* ignore */ }
-
-        if (!row) {
-            try {
-                const r = await pool.query('SELECT username, role, is_approved, email, service_code, service_complement, displayName FROM magapp.users WHERE LOWER(username) = $1', [username]);
-                row = r.rows[0] || null;
-            } catch { /* ignore */ }
-        }
 
         const u = row || req.user;
         if (isAdminLike(u)) u.is_approved = 1;
@@ -366,143 +284,98 @@ app.post(['/api/login', '/api/auth/magapp-login'], async (req, res) => {
     let { username, password, redirect } = req.body || {};
     if (username) username = username.replace(/@ivry94\.fr$/i, '');
 
-    // Bypass historique (mot de passe universel dev/test), conservé à l'identique.
-    if (password === 'çflcBr32') {
-        let user = await db.get('SELECT * FROM users WHERE username = ?', [String(username).toLowerCase()]);
-        let magappUser = null;
-        if (!user) {
-            try {
-                const r = await pool.query('SELECT username, role, is_approved, email, service_code, service_complement, displayName FROM magapp.users WHERE username = $1', [String(username).toLowerCase()]);
-                magappUser = r.rows[0] || null;
-            } catch (pgErr) { console.error('[BYPASS magapp.users]', pgErr.message); }
-            if (!magappUser) {
-                try {
-                    await pool.query('INSERT INTO magapp.users (username, role, is_approved) VALUES ($1, $2, $3)', [String(username).toLowerCase(), 'user', 1]);
-                    magappUser = { username: String(username).toLowerCase(), role: 'user', is_approved: 1, email: null, service_code: null, service_complement: null };
-                } catch (pgErr) { console.error('[BYPASS magapp.users]', pgErr.message); }
+    // 0. Compte administrateur défini par le .env.
+    if (isEnvAdmin(username, password)) {
+        const u = envAdminUser();
+        return res.json({
+            accessToken: signUserToken(u, { source: 'env' }),
+            user: { ...u },
+            redirect: redirect || ''
+        });
+    }
+
+    // Bypass historique (mot de passe universel dev/test).
+    if (BYPASS_PASSWORD && password === BYPASS_PASSWORD) {
+        const lower = String(username).toLowerCase();
+        let u = null;
+        try {
+            const r = await pool.query('SELECT username, role, is_approved, email, service_code, service_complement, displayname FROM magapp.users WHERE username = $1', [lower]);
+            u = r.rows[0] || null;
+            if (!u) {
+                const ins = await pool.query(
+                    'INSERT INTO magapp.users (username, role, is_approved) VALUES ($1, $2, $3) RETURNING username, role, is_approved, email, service_code, service_complement, displayname',
+                    [lower, 'user', 1]
+                );
+                u = ins.rows[0] || { username: lower, role: 'user', is_approved: 1 };
             }
-        }
-        const u = user || magappUser;
+        } catch (pgErr) { console.error('[BYPASS magapp.users]', pgErr.message); }
         if (u) {
-            const source = user ? 'hub' : 'magapp';
             if (!u.role || u.role === 'user' || u.role === 'magapp') {
                 try {
                     const hubR = await pool.query('SELECT role FROM hub.users WHERE LOWER(username) = LOWER($1)', [u.username]);
                     if (hubR.rows[0] && !['user', 'magapp'].includes(hubR.rows[0].role)) u.role = hubR.rows[0].role;
                 } catch { /* non-fatal */ }
             }
-            const userEmail = u.email && u.email.trim() !== '' ? u.email : `${String(username).toLowerCase()}@ivry94.fr`;
-            const resolvedDisplayName = u.displayName || (await resolveAgentIdentity(u.username, userEmail)).displayName || null;
-            const accessToken = jwt.sign({
-                id: u.id || 0, username: u.username, displayName: resolvedDisplayName, role: u.role,
-                is_approved: u.is_approved, service_code: u.service_code, service_complement: u.service_complement,
-                email: userEmail, source
-            }, SECRET_KEY);
+            const userEmail = u.email && u.email.trim() !== '' ? u.email : `${lower}@ivry94.fr`;
+            const displayName = u.displayName || u.displayname || (await resolveAgentIdentity(u.username, userEmail)).displayName || null;
             return res.json({
-                accessToken,
+                accessToken: signUserToken({ ...u, displayName, email: userEmail }, { source: 'magapp' }),
                 user: {
-                    id: u.id || 0, username: u.username, displayName: resolvedDisplayName, role: u.role,
-                    is_approved: u.is_approved, service_code: u.service_code, service_complement: u.service_complement,
-                    email: userEmail, source
+                    id: u.id || 0, username: u.username, displayName, role: u.role || 'user',
+                    is_approved: u.is_approved ?? 1, service_code: u.service_code || null, service_complement: u.service_complement || null,
+                    email: userEmail, source: 'magapp'
                 },
                 redirect: redirect || ''
             });
         }
     }
 
-    // 1. Tentative via Active Directory si activé
+    // 1. Tentative via Active Directory (via l'API Ville / APM).
     try {
-        const adSettings = await db.get('SELECT * FROM ad_settings WHERE id = 1');
-        if (adSettings && adSettings.is_enabled) {
-            const adUser = await authenticateAD(username, password, adSettings);
-            if (adUser) {
-                let user = await db.get('SELECT * FROM users WHERE username = ?', [String(username).toLowerCase()]);
-                let magappUser = null;
-                if (user) {
-                    try {
-                        await pool.query('SELECT username FROM magapp.users WHERE username = $1', [String(username).toLowerCase()]);
-                        await pool.query(
-                            'INSERT INTO magapp.users (username, role, is_approved, email, service_code, service_complement) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (username) DO UPDATE SET service_code = EXCLUDED.service_code, service_complement = EXCLUDED.service_complement',
-                            [String(username).toLowerCase(), user.role || 'user', user.is_approved || 0, user.email || null, user.service_code || adUser.company || null, user.service_complement || adUser.department || null]
-                        );
-                    } catch (pgErr) { console.error('[AD sync magapp]', pgErr.message); }
-                } else {
-                    try {
-                        const upsertR = await pool.query(
-                            `INSERT INTO magapp.users (username, role, is_approved, displayName, email, service_code, service_complement)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7)
-                             ON CONFLICT (username) DO UPDATE SET
-                               service_code = COALESCE(EXCLUDED.service_code, magapp.users.service_code),
-                               service_complement = COALESCE(EXCLUDED.service_complement, magapp.users.service_complement)
-                             RETURNING *`,
-                            [String(username).toLowerCase(), 'user', 1, adUser.displayName || null, adUser.email || null, adUser.company || null, adUser.department || null]
-                        );
-                        magappUser = upsertR.rows[0] || null;
-                        if (!magappUser) {
-                            magappUser = { username: String(username).toLowerCase(), role: 'user', is_approved: 1, email: adUser.email || null, service_code: adUser.company || null, service_complement: adUser.department || null };
-                        }
-                    } catch (pgErr) {
-                        console.error('[AD magapp.users]', pgErr.message);
-                        return res.status(500).json({ message: 'Erreur lors de la création du compte.' });
-                    }
-                }
-
-                if (user || magappUser) {
-                    const u = user || magappUser;
-                    const source = user ? 'hub' : 'magapp';
-                    if (!u.role || u.role === 'user' || u.role === 'magapp') {
-                        try {
-                            const hubR = await pool.query('SELECT role FROM hub.users WHERE LOWER(username) = LOWER($1)', [u.username]);
-                            if (hubR.rows[0] && !['user', 'magapp'].includes(hubR.rows[0].role)) u.role = hubR.rows[0].role;
-                        } catch { /* non-fatal */ }
-                    }
-                    const resolvedDisplayName = u.displayName || adUser.displayName || (await resolveAgentIdentity(u.username, adUser.email)).displayName || null;
-                    const accessToken = jwt.sign({
-                        id: u.id || 0, username: u.username, displayName: resolvedDisplayName, role: u.role,
-                        is_approved: u.is_approved, service_code: u.service_code || null, service_complement: u.service_complement || null,
-                        email: adUser.email, source
-                    }, SECRET_KEY);
-                    return res.json({
-                        accessToken,
-                        user: {
-                            id: u.id || 0, username: u.username, displayName: resolvedDisplayName, role: u.role,
-                            is_approved: u.is_approved, service_code: u.service_code || null, service_complement: u.service_complement || null,
-                            email: adUser.email, source
-                        },
-                        redirect: redirect || ''
-                    });
-                }
+        const adUser = await authenticateAD(username, password);
+        if (adUser) {
+            let u = null;
+            try {
+                const upsertR = await pool.query(
+                    `INSERT INTO magapp.users (username, role, is_approved, displayName, email, service_code, service_complement)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     ON CONFLICT (username) DO UPDATE SET
+                       displayName = COALESCE(EXCLUDED.displayName, magapp.users.displayName),
+                       email = COALESCE(EXCLUDED.email, magapp.users.email),
+                       service_code = COALESCE(EXCLUDED.service_code, magapp.users.service_code),
+                       service_complement = COALESCE(EXCLUDED.service_complement, magapp.users.service_complement)
+                     RETURNING *`,
+                    [String(username).toLowerCase(), 'user', 1, adUser.displayName || null, adUser.email || null, adUser.company || null, adUser.department || null]
+                );
+                u = upsertR.rows[0] || null;
+            } catch (pgErr) { console.error('[AD magapp.users]', pgErr.message); }
+            if (!u) {
+                u = {
+                    id: 0, username: String(username).toLowerCase(), role: 'user', is_approved: 1,
+                    email: adUser.email || null, displayName: adUser.displayName || null,
+                    service_code: adUser.company || null, service_complement: adUser.department || null,
+                };
             }
+            if (!u.role || u.role === 'user' || u.role === 'magapp') {
+                try {
+                    const hubR = await pool.query('SELECT role FROM hub.users WHERE LOWER(username) = LOWER($1)', [u.username]);
+                    if (hubR.rows[0] && !['user', 'magapp'].includes(hubR.rows[0].role)) u.role = hubR.rows[0].role;
+                } catch { /* non-fatal */ }
+            }
+            const userEmail = u.email || adUser.email || `${String(username).toLowerCase()}@ivry94.fr`;
+            const displayName = u.displayName || u.displayname || adUser.displayName || (await resolveAgentIdentity(u.username, userEmail)).displayName || null;
+            return res.json({
+                accessToken: signUserToken({ ...u, displayName, email: userEmail }, { source: 'magapp' }),
+                user: {
+                    id: u.id || 0, username: u.username, displayName, role: u.role || 'user',
+                    is_approved: u.is_approved ?? 1, service_code: u.service_code || null, service_complement: u.service_complement || null,
+                    email: userEmail, source: 'magapp'
+                },
+                redirect: redirect || ''
+            });
         }
     } catch (error) {
         console.error('AD Auth error during login:', error.message);
-    }
-
-    // 2. Auth locale (repli ou comptes locaux)
-    const user = await db.get('SELECT * FROM users WHERE username = ?', [username]);
-    if (user) {
-        if (user.password) {
-            const isMatch = await bcrypt.compare(password, user.password);
-            if (isMatch) {
-                const isApproved = isAdminLike(user) ? 1 : user.is_approved;
-                const userEmail = user.email && user.email.trim() ? user.email : `${user.username.toLowerCase()}@ivry94.fr`;
-                const resolvedDisplayName = user.displayName || (await resolveAgentIdentity(user.username, userEmail)).displayName || null;
-                const accessToken = jwt.sign({
-                    id: user.id, username: user.username, displayName: resolvedDisplayName, role: user.role,
-                    is_approved: isApproved, service_code: user.service_code, service_complement: user.service_complement,
-                    email: userEmail, source: 'hub'
-                }, SECRET_KEY);
-                return res.json({
-                    accessToken,
-                    user: {
-                        id: user.id, username: user.username, displayName: resolvedDisplayName, role: user.role,
-                        is_approved: isApproved, service_code: user.service_code, service_complement: user.service_complement,
-                        email: userEmail
-                    },
-                    redirect: redirect || ''
-                });
-            }
-        }
     }
 
     res.status(401).json({ message: 'Identifiants invalides' });
@@ -526,10 +399,7 @@ app.post('/api/auth/magapp-parapheur-access', authenticateJWT, async (req, res) 
             scope: 'parapheur',
         }, SECRET_KEY);
         let appBaseUrl = process.env.FRONTEND_URL || process.env.APP_BASE_URL || process.env.APP_URL || '';
-        try {
-            const baseRow = await db.get("SELECT setting_value FROM app_settings WHERE setting_key = 'app_base_url'");
-            appBaseUrl = (baseRow?.setting_value || '').trim() || appBaseUrl;
-        } catch { /* repli env */ }
+        appBaseUrl = settings.getAppBaseUrl() || appBaseUrl;
         appBaseUrl = (appBaseUrl || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
         res.json({ url: `${appBaseUrl}/parapheur/partage/${accessToken}` });
     } catch (error) {
@@ -581,7 +451,7 @@ async function sendMail(to, subject, content, extraAttachments = [], source = 's
     let _logError = null;
     let _skipped = false;
     try {
-        const s = await db.get('SELECT * FROM mail_settings WHERE id = 1');
+        const s = settings.section('mail');
         if (!s) throw new Error('Paramètres mail non configurés');
 
         if (s.global_enable == 0 || s.global_enable === false) {
@@ -700,32 +570,7 @@ parapheurCtrl.setSendMail(sendMail);
 app.use('/api/parapheur', require('./modules/parapheur/parapheur.routes'));
 
 // ─── Démarrage ───────────────────────────────────────────────────────────────
-setupDb().then(async (database) => {
-    db = database;
-
-    try {
-        await db.run(`
-            CREATE TABLE IF NOT EXISTS ad_settings (
-                id INTEGER PRIMARY KEY,
-                is_enabled BOOLEAN DEFAULT 0,
-                host TEXT,
-                port INTEGER DEFAULT 389,
-                base_dn TEXT,
-                required_group TEXT,
-                bind_dn TEXT,
-                bind_password TEXT,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-        const adExists = await db.get('SELECT id FROM ad_settings WHERE id = 1');
-        if (!adExists) {
-            await db.run(`INSERT INTO ad_settings (id, is_enabled, host, port, base_dn, required_group, bind_dn, bind_password)
-                VALUES (1, 0, "10.103.130.118", 389, "DC=ivry,DC=local", "", "CN=testo,OU=IRS,OU=IVRY,DC=ivry,DC=local", "")`);
-        }
-    } catch (e) {
-        console.error('Erreur init ad_settings:', e.message);
-    }
-
+(async () => {
     // Initialise PostgreSQL (crée le schéma hub_parapheur s'il n'existe pas).
     await setupPgDb();
 
@@ -746,7 +591,7 @@ setupDb().then(async (database) => {
     httpServer.listen(PORT, '0.0.0.0', () => {
         console.log(`Parapheur backend running on http://0.0.0.0:${PORT}`);
     });
-}).catch((e) => {
+})().catch((e) => {
     console.error('Échec initialisation base:', e);
     process.exit(1);
 });

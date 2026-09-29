@@ -20,14 +20,15 @@
 const axios = require('axios');
 const https = require('https');
 const FormData = require('form-data');
-const { getSqlite } = require('./database');
+const settings = require('./settings');
 const { createSecretBox, looksEncrypted } = require('./secretbox');
 const { SECRET_KEY } = require('./config');
 
 const API = '/alfresco/api/-default-/public/alfresco/versions/1';
 
-// Nom du site / dossier racine : entièrement paramétrable via /admin/ged
-// (clé SQLite « alfresco.root_path »). Aucune valeur par défaut n'est imposée.
+// Nom du site / dossier racine : paramétrable via .env (ALFRESCO_ROOT_PATH) ou
+// l'administration /admin/ged (écrit dans data/settings.json). Aucune valeur par
+// défaut n'est imposée.
 
 const box = createSecretBox(SECRET_KEY, 'ged');
 
@@ -38,43 +39,27 @@ function decryptStoredPassword(stored) {
     return looksEncrypted(stored) ? box.dechiffre(stored) : String(stored);
 }
 
-async function readSetting(key) {
-    const db = getSqlite();
-    if (!db) throw new Error('Base SQLite non initialisée.');
-    const row = await db.get('SELECT setting_value FROM app_settings WHERE setting_key = ?', [key]);
-    return (row && row.setting_value) || '';
-}
-
-/** Lit et déchiffre la configuration Alfresco. */
+/** Lit et déchiffre la configuration Alfresco (.env / data/settings.json). */
 async function getConfig() {
-    const [url, username, storedPass, rootPath] = await Promise.all([
-        readSetting('alfresco.url'),
-        readSetting('alfresco.username'),
-        readSetting('alfresco.password'),
-        readSetting('alfresco.root_path'),
-    ]);
+    const s = settings.section('alfresco');
     return {
-        url: (url || '').trim(),
-        username: (username || '').trim(),
-        password: decryptStoredPassword(storedPass),
-        rootPath: (rootPath || '').trim(),
+        url: String(s.url || '').trim(),
+        username: String(s.username || '').trim(),
+        password: decryptStoredPassword(s.password),
+        rootPath: String(s.root_path || '').trim(),
     };
 }
 
 /** Enregistre la configuration (le mot de passe est chiffré avant stockage). */
 async function saveConfig({ url, username, password, rootPath } = {}) {
-    const db = getSqlite();
-    if (!db) throw new Error('Base SQLite non initialisée.');
-    const sql = `INSERT INTO app_settings (setting_key, setting_value, description)
-        VALUES (?, ?, ?)
-        ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value, description = excluded.description`;
-
-    await db.run(sql, ['alfresco.url', url || '', 'URL du serveur Alfresco (ex: https://alfresco.ivry.local)']);
-    await db.run(sql, ['alfresco.username', username || '', 'Compte de service Alfresco']);
-    await db.run(sql, ['alfresco.root_path', rootPath || '', 'Dossier/site racine GED (ex. site:DSIHUB ou /Sites/DSIHUB/documentLibrary)']);
+    const patch = {};
+    if (url !== undefined) patch.url = url || '';
+    if (username !== undefined) patch.username = username || '';
+    if (rootPath !== undefined) patch.root_path = rootPath || '';
     if (password !== undefined && password !== null && password !== '') {
-        await db.run(sql, ['alfresco.password', box.chiffre(password), 'Mot de passe du compte de service Alfresco (chiffré)']);
+        patch.password = box.chiffre(password);
     }
+    settings.updateSection('alfresco', patch);
 }
 
 function isConfigured(cfg) {

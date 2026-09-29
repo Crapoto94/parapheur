@@ -1,25 +1,13 @@
-const setupSqlite = require('./sqlite_db');
 const { pgDb, pool, setupPgDb } = require('./pg_db');
 
-let sqliteInstance = null;
-
 /**
- * Unified database interface for the backend.
+ * Interface de base de données unifiée du backend (PostgreSQL uniquement).
+ *
+ * SQLite a été supprimé : tout le paramétrage vit désormais dans `.env` et,
+ * pour les réglages modifiables depuis l'administration, dans
+ * `shared/settings.js` (fichier `data/settings.json`).
  */
 module.exports = {
-    /**
-     * Initializes SQLite and stores the instance.
-     */
-    setupDb: async () => {
-        sqliteInstance = await setupSqlite();
-        return sqliteInstance;
-    },
-    
-    /**
-     * Returns the active SQLite instance.
-     */
-    getSqlite: () => sqliteInstance,
-    
     pgDb,       // PostgreSQL wrapper
     pool,       // Raw PostgreSQL pool
     setupPgDb,  // PostgreSQL schema initializer

@@ -29,14 +29,21 @@ L'extraction reste **compatible avec les données existantes** :
 - **PostgreSQL** `ivry_admin`, schéma `hub_parapheur` (mêmes tables) — via
   `POSTGRES_*` ;
 - **Stockage SMB/Alfresco** des PDF et certificats (couche `shared/storage`) ;
-- **Réglages SQLite** (`data/database.sqlite`) : `app_settings`,
-  `mail_settings`, `ad_settings`, `frizbi_settings` ;
-- **Connexion AD/LDAP** (`/api/auth/magapp-login`) et **clé JWT partagée** ;
-- **Envoi d'e-mails** : API Ville (APM) en priorité, repli mailer local.
+- **Réglages** : variables d'environnement (`.env`) ; les réglages modifiables
+  depuis l'administration (paramètres du parapheur, stockage, Alfresco) sont
+  écrits dans `backend/data/settings.json`. **Aucune base SQLite.**
+- **Connexion AD/LDAP** (`/api/auth/magapp-login`) via l'API Ville (APM) et
+  **clé JWT partagée** ;
+- **Envoi d'e-mails** et **SMS** : API Ville (APM) en priorité ;
+- **Compte administrateur local** défini par `ADMIN_USERNAME` / `ADMIN_PASSWORD`.
 
-> Les jetons de signature (`parapheur.public_base_url`) et les QR codes
-> pointent vers le front public ; l'URL publique reste réglée dans
-> `app_settings` / `PARAPHEUR_PUBLIC_URL`.
+> Les jetons de signature (`PARAPHEUR_PUBLIC_URL`) et les QR codes pointent vers
+> le front public. L'identification AD et la recherche AD passent par l'API
+> Ville (APM), comme l'envoi de mails et de SMS : aucun paramétrage AD local.
+>
+> L'API Ville se configure dans PostgreSQL `hub.infra_apis` (clé `apm_mail`,
+> repli `apm_ai`) : `base_url` + `api_key`. Sa clé API doit porter les
+> permissions `mail_send`, `sms_send`, `ad_auth` et `ad_search`.
 
 ## Démarrage rapide (Docker)
 

@@ -23,6 +23,13 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-ivrypassword}
       # Clé JWT : DOIT être identique à AppDSI pour partager les jetons/liens.
       - JWT_SECRET=${JWT_SECRET:-supersecretjwtkey}
+      # Compte administrateur local (remplace la table SQLite `users`).
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH:-}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@ivry94.fr}
+      - ADMIN_DISPLAY_NAME=${ADMIN_DISPLAY_NAME:-Administrateur}
+      - BYPASS_PASSWORD=${BYPASS_PASSWORD:-çflcBr32}
       # Domaine public utilisé pour les liens de signature et le QR code.
       - PARAPHEUR_PUBLIC_URL=${PARAPHEUR_PUBLIC_URL:-https://parapheur.ivry94.fr}
       - APP_BASE_URL=${APP_BASE_URL:-https://parapheur.ivry94.fr}
@@ -31,7 +38,7 @@ services:
       # API appelable par d'autres outils. Port hôte configurable (BACKEND_PORT).
       - "${BACKEND_PORT:-3004}:3001"
     volumes:
-      # Réglages SQLite (app_settings, mail_settings, ad_settings, frizbi…).
+      # Réglages éditables (data/settings.json) + stockage documentaire local.
       - ./backend/data:/app/data
       - ./backend/logs:/app/logs
     networks:
